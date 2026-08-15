@@ -58,7 +58,8 @@ router.post("/", requireAuth, async (req, res) => {
       [id, property_id, req.user.id, owner_id, message || null, visit_date || null]
     );
     await pool.query(
-      "UPDATE nivaas_properties SET inquiries_count = inquiries_count + 1 WHERE id = ?", [property_id]
+      "UPDATE nivaas_properties SET inquiries_count = inquiries_count + 1 WHERE id = ?",
+      [property_id]
     );
 
     const [newInq] = await pool.query("SELECT * FROM nivaas_inquiries WHERE id = ?", [id]);

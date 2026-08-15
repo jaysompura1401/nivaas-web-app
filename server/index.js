@@ -1,32 +1,33 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import { fileURLToPath } from "url";
-import path from "path";
-import { existsSync, mkdirSync } from "fs";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname  = path.dirname(__filename);
 
 dotenv.config();
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 4000;
 
-// Ensure uploads directory exists
-const uploadsDir = path.join(__dirname, "uploads");
-if (!existsSync(uploadsDir)) mkdirSync(uploadsDir, { recursive: true });
-
 // ─── Middleware ───────────────────────────────────────────────────────────────
+const allowedOrigins = [
+  "http://localhost:8080",
+  "http://localhost:5173",
+  "http://localhost:4173",
+  process.env.CLIENT_URL,       // production Vercel URL
+].filter(Boolean);
+
 app.use(cors({
-  origin: ["http://localhost:8080", "http://localhost:5173", "http://localhost:4173"],
+  origin: (origin, cb) => {
+    // Allow requests with no origin (mobile apps, curl, server-to-server)
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    // Also allow any *.vercel.app preview URLs
+    if (/\.vercel\.app$/.test(origin)) return cb(null, true);
+    cb(new Error("CORS: origin not allowed — " + origin));
+  },
   credentials: true,
 }));
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
-
-// Serve uploaded images as static files → http://localhost:4000/uploads/filename.jpg
-app.use("/uploads", express.static(uploadsDir));
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 import authRouter          from "./routes/auth.js";
@@ -67,10 +68,10 @@ app.use("/api/admin",         adminRouter);
 
 // Health check
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
+  res.json({ status: "ok", time: new Date().toISOString(), db: "supabase/postgresql" });
 });
 
-// ─── 404 ──────────────────────────────────────────────────────────────────────
+// 404
 app.use((_req, res) => {
   res.status(404).json({ error: "Route not found" });
 });

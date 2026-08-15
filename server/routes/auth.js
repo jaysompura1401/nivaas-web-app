@@ -70,7 +70,7 @@ router.post("/register", async (req, res) => {
 
     await pool.query(
       `INSERT INTO nivaas_users (id, full_name, email, phone, password_hash, role, is_verified)
-       VALUES (?, ?, ?, ?, ?, ?, 0)`,
+       VALUES (?, ?, ?, ?, ?, ?, false)`,
       [id, full_name || null, email, phone || null, hash, role]
     );
 
@@ -140,7 +140,6 @@ router.post("/verify-otp", async (req, res) => {
     const { email, otp } = req.body;
     if (!email || !otp) return res.status(400).json({ error: "Email and OTP required" });
 
-    // Try email key first, then phone variants
     let stored = otpStore.get(email);
 
     if (!stored) return res.status(400).json({ error: "No OTP found. Request a new one." });
@@ -152,10 +151,10 @@ router.post("/verify-otp", async (req, res) => {
       return res.status(400).json({ error: "Incorrect OTP" });
     }
 
-    // Clear all keys for this OTP
     otpStore.delete(email);
 
-    await pool.query("UPDATE nivaas_users SET is_verified = 1 WHERE email = ?", [email]);
+    // PostgreSQL uses true/false (not 1/0)
+    await pool.query("UPDATE nivaas_users SET is_verified = true WHERE email = ?", [email]);
 
     const [rows] = await pool.query(
       "SELECT id, full_name, email, phone, avatar_url, city, role FROM nivaas_users WHERE email = ?",

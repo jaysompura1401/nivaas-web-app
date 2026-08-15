@@ -3,11 +3,6 @@ import pool from "../db.js";
 
 /**
  * Insert a notification row for a user.
- * @param {string} userId
- * @param {string} type        - e.g. 'rent_reminder', 'visit_confirmed', 'complaint_update'
- * @param {string} title
- * @param {string} body
- * @param {string|null} link   - optional deep-link path in the app
  */
 export async function createNotification(userId, type, title, body, link = null) {
   try {
@@ -25,7 +20,7 @@ export async function createNotification(userId, type, title, body, link = null)
 
 /**
  * Generate automatic monthly rent reminder notifications for all active agreements.
- * Call this from a cron job or manually trigger via admin endpoint.
+ * PostgreSQL: CURRENT_DATE instead of CURDATE(), no MySQL date functions.
  */
 export async function generateRentReminders() {
   try {
@@ -50,27 +45,19 @@ export async function generateRentReminders() {
 
       let title = null, body = null;
 
-      if (diffDays === 7)  { title = "Rent Due in 7 Days";  body = `₹${p.amount} due on ${p.due_date} for ${p.property_title}`; }
-      if (diffDays === 3)  { title = "Rent Due in 3 Days";  body = `₹${p.amount} due on ${p.due_date} for ${p.property_title}`; }
-      if (diffDays === 1)  { title = "Rent Due Tomorrow";   body = `₹${p.amount} due tomorrow for ${p.property_title}`; }
-      if (diffDays === 0)  { title = "Rent Due Today";       body = `₹${p.amount} is due today for ${p.property_title}`; }
-      if (diffDays === -1) { title = "Rent Overdue – 1 Day"; body = `₹${p.amount} was due yesterday for ${p.property_title}. Please pay immediately.`; }
+      if (diffDays === 7)  { title = "Rent Due in 7 Days";   body = `₹${p.amount} due on ${p.due_date} for ${p.property_title}`; }
+      if (diffDays === 3)  { title = "Rent Due in 3 Days";   body = `₹${p.amount} due on ${p.due_date} for ${p.property_title}`; }
+      if (diffDays === 1)  { title = "Rent Due Tomorrow";    body = `₹${p.amount} due tomorrow for ${p.property_title}`; }
+      if (diffDays === 0)  { title = "Rent Due Today";        body = `₹${p.amount} is due today for ${p.property_title}`; }
+      if (diffDays === -1) { title = "Rent Overdue – 1 Day";  body = `₹${p.amount} was due yesterday for ${p.property_title}. Please pay immediately.`; }
       if (diffDays === -3) { title = "Rent Overdue – 3 Days"; body = `₹${p.amount} is 3 days overdue for ${p.property_title}.`; }
       if (diffDays === -7) { title = "Rent Overdue – 7 Days"; body = `₹${p.amount} is 7 days overdue for ${p.property_title}. Escalating to owner.`; }
 
       if (title) {
-        // Notify tenant
         await createNotification(p.tenant_id, "rent_reminder", title, body, "/dashboard/rentals");
-        // Notify owner on overdue
         if (diffDays < 0) {
-          await createNotification(p.owner_id, "rent_overdue",
-            `Tenant Rent Overdue`,
-            body,
-            "/dashboard/rentals"
-          );
-        }
-        // Mark overdue in DB
-        if (diffDays < 0) {
+          await createNotification(p.owner_id, "rent_overdue", "Tenant Rent Overdue", body, "/dashboard/rentals");
+          // PostgreSQL uses true/false
           await pool.query(
             "UPDATE nivaas_rent_payments SET status='overdue' WHERE id=? AND status='pending'",
             [p.id]

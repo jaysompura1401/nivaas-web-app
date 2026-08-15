@@ -8,15 +8,16 @@ const router = Router();
 // GET /api/messages/threads — grouped conversations
 router.get("/threads", requireAuth, async (req, res) => {
   try {
+    // PostgreSQL: CASE WHEN instead of MySQL's IF()
     const [rows] = await pool.query(
       `SELECT
          m.id, m.content, m.created_at, m.is_read,
          m.sender_id, m.receiver_id,
-         IF(m.sender_id = ?, m.receiver_id, m.sender_id) AS other_user_id,
+         CASE WHEN m.sender_id = ? THEN m.receiver_id ELSE m.sender_id END AS other_user_id,
          u.full_name AS other_user_name, u.avatar_url AS other_user_avatar,
          p.title AS property_title, p.id AS property_id
        FROM nivaas_messages m
-       JOIN nivaas_users u ON u.id = IF(m.sender_id = ?, m.receiver_id, m.sender_id)
+       JOIN nivaas_users u ON u.id = CASE WHEN m.sender_id = ? THEN m.receiver_id ELSE m.sender_id END
        LEFT JOIN nivaas_properties p ON p.id = m.property_id
        WHERE m.sender_id = ? OR m.receiver_id = ?
        ORDER BY m.created_at DESC`,
@@ -46,7 +47,7 @@ router.get("/:userId", requireAuth, async (req, res) => {
     const { property_id } = req.query;
 
     let sql = `
-      SELECT m.*, 
+      SELECT m.*,
              su.full_name AS sender_name, su.avatar_url AS sender_avatar
       FROM nivaas_messages m
       JOIN nivaas_users su ON su.id = m.sender_id
@@ -59,9 +60,9 @@ router.get("/:userId", requireAuth, async (req, res) => {
 
     const [rows] = await pool.query(sql, params);
 
-    // Mark as read
+    // Mark as read — PostgreSQL uses true/false
     await pool.query(
-      "UPDATE nivaas_messages SET is_read = 1 WHERE receiver_id = ? AND sender_id = ?",
+      "UPDATE nivaas_messages SET is_read = true WHERE receiver_id = ? AND sender_id = ?",
       [req.user.id, userId]
     );
 

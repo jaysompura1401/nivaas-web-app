@@ -12,7 +12,6 @@ router.get("/", requireAuth, async (req, res) => {
     const [rows] = await pool.query(
       `SELECT rp.*,
               ag.monthly_rent, ag.property_id,
-              ag.rent_due_day, ag.grace_period_days, ag.late_fee_amount,
               p.title AS property_title, p.locality, p.city,
               t.full_name AS tenant_name, t.phone AS tenant_phone, t.email AS tenant_email
        FROM nivaas_rent_payments rp
@@ -35,7 +34,6 @@ router.get("/tenant", requireAuth, async (req, res) => {
     const [rows] = await pool.query(
       `SELECT rp.*,
               ag.monthly_rent, ag.property_id, ag.start_date, ag.end_date,
-              ag.rent_due_day, ag.grace_period_days,
               p.title AS property_title, p.locality, p.city, p.cover_image_url,
               o.full_name AS owner_name, o.phone AS owner_phone
        FROM nivaas_rent_payments rp
@@ -56,13 +54,17 @@ router.get("/tenant", requireAuth, async (req, res) => {
 router.get("/stats", requireAuth, async (req, res) => {
   try {
     const isOwner = req.query.role !== "tenant";
-
     const idField = isOwner ? "ag.owner_id" : "ag.tenant_id";
+
+    // PostgreSQL: EXTRACT + CURRENT_DATE instead of MONTH/YEAR + CURDATE
     const [rows] = await pool.query(
       `SELECT
-         SUM(CASE WHEN rp.status='paid' AND MONTH(rp.paid_date)=MONTH(CURDATE()) AND YEAR(rp.paid_date)=YEAR(CURDATE()) THEN rp.amount ELSE 0 END) AS collected,
-         SUM(CASE WHEN rp.status IN ('pending') THEN rp.amount ELSE 0 END)  AS pending,
-         SUM(CASE WHEN rp.status = 'overdue'    THEN rp.amount ELSE 0 END)  AS overdue,
+         SUM(CASE WHEN rp.status='paid'
+           AND EXTRACT(MONTH FROM rp.paid_date)=EXTRACT(MONTH FROM CURRENT_DATE)
+           AND EXTRACT(YEAR  FROM rp.paid_date)=EXTRACT(YEAR  FROM CURRENT_DATE)
+           THEN rp.amount ELSE 0 END) AS collected,
+         SUM(CASE WHEN rp.status = 'pending' THEN rp.amount ELSE 0 END) AS pending,
+         SUM(CASE WHEN rp.status = 'overdue' THEN rp.amount ELSE 0 END) AS overdue,
          COUNT(DISTINCT ag.id) AS total_agreements
        FROM nivaas_rent_payments rp
        JOIN nivaas_agreements ag ON ag.id = rp.agreement_id
@@ -84,7 +86,6 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
       [status, paid_date || null, transaction_id || null, payment_method || null, req.params.id]
     );
 
-    // Notify owner + tenant if paid
     if (status === "paid") {
       const [rows] = await pool.query(
         `SELECT rp.amount, rp.due_date,
@@ -118,7 +119,6 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/rentals/generate/:agreementId ──────────────────────────────────
-// Auto-generate monthly rent payment rows for a signed agreement
 router.post("/generate/:agreementId", requireAuth, async (req, res) => {
   try {
     const [agRows] = await pool.query(
@@ -135,7 +135,6 @@ router.post("/generate/:agreementId", requireAuth, async (req, res) => {
     const end    = new Date(ag.end_date);
     const dueDay = ag.rent_due_day || 1;
 
-    // Build array of monthly due dates
     const payments = [];
     let cursor = new Date(start.getFullYear(), start.getMonth(), dueDay);
     if (cursor < start) {
@@ -153,7 +152,6 @@ router.post("/generate/:agreementId", requireAuth, async (req, res) => {
       cursor = new Date(cursor.getFullYear(), cursor.getMonth() + 1, dueDay);
     }
 
-    // Insert only rows that don't already exist for this agreement/due_date
     let created = 0;
     for (const p of payments) {
       const [exists] = await pool.query(
@@ -176,13 +174,11 @@ router.post("/generate/:agreementId", requireAuth, async (req, res) => {
 });
 
 // ─── GET /api/rentals/receipt/:id ─────────────────────────────────────────────
-// Returns all data needed to render a rent receipt
 router.get("/receipt/:id", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT rp.*,
               ag.monthly_rent, ag.security_deposit, ag.start_date, ag.end_date,
-              ag.rent_due_day,
               p.title AS property_title, p.address, p.locality, p.city, p.state, p.pincode,
               o.full_name AS owner_name, o.phone AS owner_phone, o.email AS owner_email,
               t.full_name AS tenant_name, t.phone AS tenant_phone, t.email AS tenant_email
@@ -197,13 +193,11 @@ router.get("/receipt/:id", requireAuth, async (req, res) => {
     if (!rows.length) return res.status(404).json({ error: "Payment not found" });
     const receipt = rows[0];
 
-    // Access control — only owner or tenant may download
     const isAllowed = receipt.owner_id === req.user.id ||
                       receipt.tenant_id === req.user.id ||
                       req.user.role === "admin";
     if (!isAllowed) return res.status(403).json({ error: "Forbidden" });
 
-    // Add receipt number
     receipt.receipt_number = `NIVAAS-${receipt.id.slice(0, 8).toUpperCase()}`;
     receipt.generated_at   = new Date().toISOString();
 

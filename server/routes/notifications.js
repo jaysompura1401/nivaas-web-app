@@ -18,7 +18,7 @@ router.get("/", requireAuth, async (req, res) => {
       [req.user.id, limit, offset]
     );
     const [[{ unread }]] = await pool.query(
-      "SELECT COUNT(*) AS unread FROM nivaas_notifications WHERE user_id=? AND is_read=0",
+      "SELECT COUNT(*) AS unread FROM nivaas_notifications WHERE user_id=? AND is_read=false",
       [req.user.id]
     );
     res.json({ data: rows, unread });
@@ -31,7 +31,7 @@ router.get("/", requireAuth, async (req, res) => {
 router.patch("/read-all", requireAuth, async (req, res) => {
   try {
     await pool.query(
-      "UPDATE nivaas_notifications SET is_read=1 WHERE user_id=?",
+      "UPDATE nivaas_notifications SET is_read=true WHERE user_id=?",
       [req.user.id]
     );
     res.json({ message: "All marked as read" });
@@ -44,7 +44,7 @@ router.patch("/read-all", requireAuth, async (req, res) => {
 router.patch("/:id/read", requireAuth, async (req, res) => {
   try {
     await pool.query(
-      "UPDATE nivaas_notifications SET is_read=1 WHERE id=? AND user_id=?",
+      "UPDATE nivaas_notifications SET is_read=true WHERE id=? AND user_id=?",
       [req.params.id, req.user.id]
     );
     res.json({ message: "Marked as read" });
@@ -67,7 +67,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/notifications/trigger-reminders ───────────────────────────────
-// Admin-only endpoint to fire rent reminder generation
 router.post("/trigger-reminders", requireAuth, async (req, res) => {
   try {
     if (req.user.role !== "admin") return res.status(403).json({ error: "Admins only" });

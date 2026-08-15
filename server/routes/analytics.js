@@ -15,16 +15,17 @@ router.get("/summary", requireAuth, async (req, res) => {
          COUNT(p.id)            AS total_listings,
          SUM(CASE WHEN p.status='active'  THEN 1 ELSE 0 END) AS active_listings,
          SUM(CASE WHEN p.status='rented'  THEN 1 ELSE 0 END) AS rented_listings,
-         SUM(CASE WHEN p.verified=1       THEN 1 ELSE 0 END) AS verified_listings
+         SUM(CASE WHEN p.verified = true  THEN 1 ELSE 0 END) AS verified_listings
        FROM nivaas_properties p
        WHERE p.owner_id = ?`,
       [req.user.id]
     );
 
+    // PostgreSQL: CURRENT_DATE, date_trunc, EXTRACT instead of MySQL date functions
     const [payments] = await pool.query(
       `SELECT
-         SUM(CASE WHEN rp.status='paid' AND YEAR(rp.paid_date)=YEAR(CURDATE()) THEN rp.amount ELSE 0 END) AS yearly_collected,
-         SUM(CASE WHEN rp.status='paid' AND MONTH(rp.paid_date)=MONTH(CURDATE()) AND YEAR(rp.paid_date)=YEAR(CURDATE()) THEN rp.amount ELSE 0 END) AS monthly_collected,
+         SUM(CASE WHEN rp.status='paid' AND EXTRACT(YEAR FROM rp.paid_date)=EXTRACT(YEAR FROM CURRENT_DATE) THEN rp.amount ELSE 0 END) AS yearly_collected,
+         SUM(CASE WHEN rp.status='paid' AND EXTRACT(MONTH FROM rp.paid_date)=EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM rp.paid_date)=EXTRACT(YEAR FROM CURRENT_DATE) THEN rp.amount ELSE 0 END) AS monthly_collected,
          SUM(CASE WHEN rp.status IN ('pending','overdue') THEN rp.amount ELSE 0 END) AS pending_rent,
          COUNT(DISTINCT rp.id) AS total_transactions
        FROM nivaas_rent_payments rp
@@ -51,7 +52,6 @@ router.get("/summary", requireAuth, async (req, res) => {
       [req.user.id]
     );
 
-    // Conversion rate = rented / (active+rented) listings
     const total   = Number(props[0].active_listings || 0) + Number(props[0].rented_listings || 0);
     const rented  = Number(props[0].rented_listings || 0);
     const conversion_rate = total > 0 ? Math.round((rented / total) * 100) : 0;
@@ -69,17 +69,20 @@ router.get("/summary", requireAuth, async (req, res) => {
 });
 
 // GET /api/analytics/monthly — last 6 months rent income
+// PostgreSQL: TO_CHAR() instead of DATE_FORMAT(); CURRENT_DATE - INTERVAL instead of DATE_SUB/CURDATE
 router.get("/monthly", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT
-         DATE_FORMAT(rp.paid_date, '%b') AS month,
-         MONTH(rp.paid_date) AS month_num,
-         YEAR(rp.paid_date) AS year,
+         TO_CHAR(rp.paid_date, 'Mon') AS month,
+         EXTRACT(MONTH FROM rp.paid_date)::int AS month_num,
+         EXTRACT(YEAR  FROM rp.paid_date)::int AS year,
          SUM(rp.amount) AS total
        FROM nivaas_rent_payments rp
        JOIN nivaas_agreements ag ON ag.id = rp.agreement_id
-       WHERE ag.owner_id = ? AND rp.status = 'paid' AND rp.paid_date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+       WHERE ag.owner_id = ?
+         AND rp.status = 'paid'
+         AND rp.paid_date >= CURRENT_DATE - INTERVAL '6 months'
        GROUP BY year, month_num, month
        ORDER BY year ASC, month_num ASC`,
       [req.user.id]
@@ -94,11 +97,15 @@ router.get("/monthly", requireAuth, async (req, res) => {
 router.get("/visits", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT DATE_FORMAT(v.visit_date,'%b') AS month, MONTH(v.visit_date) AS month_num,
-              YEAR(v.visit_date) AS year, COUNT(*) AS total,
-              SUM(CASE WHEN v.status='completed' THEN 1 ELSE 0 END) AS completed
+      `SELECT
+         TO_CHAR(v.visit_date, 'Mon') AS month,
+         EXTRACT(MONTH FROM v.visit_date)::int AS month_num,
+         EXTRACT(YEAR  FROM v.visit_date)::int AS year,
+         COUNT(*) AS total,
+         SUM(CASE WHEN v.status='completed' THEN 1 ELSE 0 END) AS completed
        FROM nivaas_property_visits v
-       WHERE v.owner_id=? AND v.visit_date >= DATE_SUB(CURDATE(), INTERVAL 6 MONTH)
+       WHERE v.owner_id = ?
+         AND v.visit_date >= CURRENT_DATE - INTERVAL '6 months'
        GROUP BY year, month_num, month
        ORDER BY year, month_num`,
       [req.user.id]
@@ -109,7 +116,7 @@ router.get("/visits", requireAuth, async (req, res) => {
   }
 });
 
-// GET /api/analytics/tenant-summary — tenant-facing dashboard summary
+// GET /api/analytics/tenant-summary
 router.get("/tenant-summary", requireAuth, async (req, res) => {
   try {
     const [agreements] = await pool.query(

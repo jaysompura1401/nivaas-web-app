@@ -8,21 +8,14 @@ import { requireAuth, optionalAuth } from "../middleware/auth.js";
 const router = Router();
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LOCATION POLICY (enforced throughout this file):
-//
+// LOCATION POLICY:
 //   ✅ Only owner-provided Google Maps coordinates are stored and returned.
 //   ❌ No city-center fallback coordinates.
 //   ❌ No random jitter / approximate location injection.
-//   ❌ No locality-based geocoding.
-//
 //   Single source of truth: nivaas_property_locations table.
-//   If a property has no row in that table → no location data → no map pin.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── HTTP redirect follower ───────────────────────────────────────────────────
-// Follows up to 10 redirects. Returns { finalUrl, body, status }.
-// Uses a mobile User-Agent so Google serves a redirect page, not a JS app.
-
 function httpGetFollow(url, depth = 0) {
   if (depth > 10) return Promise.reject(new Error("Too many redirects"));
   return new Promise((resolve, reject) => {
@@ -58,9 +51,6 @@ function httpGetFollow(url, depth = 0) {
 }
 
 // ─── Coordinate extractor ─────────────────────────────────────────────────────
-// Tries every known Google Maps URL encoding. All patterns require ≥4 decimal
-// places to avoid false matches on integers.
-
 function extractCoordsFromStr(src) {
   if (!src || typeof src !== "string") return null;
   let m;
@@ -88,30 +78,19 @@ function validCoords(c) {
   );
 }
 
-// ─── Google Maps URL resolver ─────────────────────────────────────────────────
-// 4-step cascade. Returns { lat, lng } or null — never throws.
-// Step 1: Direct regex on the URL string (instant for full maps.google.com URLs).
-// Step 2: Follow redirects (maps.app.goo.gl short links → real URL).
-// Step 3: Regex on the final redirected URL.
-// Step 4: Scan HTML body for og:url, canonical, window.location, JSON coords.
-
 async function resolveCoordsFromMapUrl(mapUrl) {
   if (!mapUrl) return null;
   try {
-    // Step 1 — direct
     const direct = extractCoordsFromStr(mapUrl);
     if (validCoords(direct)) return direct;
 
-    // Step 2 — follow redirects
     const { finalUrl, body } = await httpGetFollow(mapUrl);
 
-    // Step 3 — regex on final URL
     if (finalUrl && finalUrl !== mapUrl) {
       const redirectCoords = extractCoordsFromStr(finalUrl);
       if (validCoords(redirectCoords)) return redirectCoords;
     }
 
-    // Step 4 — scan HTML body
     const patterns = [
       /property=["']og:url["'][^>]+content=["']([^"']+)["']/i,
       /content=["']([^"']+)["'][^>]+property=["']og:url["']/i,
@@ -138,20 +117,17 @@ async function resolveCoordsFromMapUrl(mapUrl) {
   return null;
 }
 
-// ─── Save / upsert a location row ─────────────────────────────────────────────
-// Inserts or replaces the row in nivaas_property_locations.
-// Called from POST and PATCH whenever valid coords are available.
-
+// ─── Upsert location row (PostgreSQL ON CONFLICT syntax) ──────────────────────
 async function upsertPropertyLocation(propertyId, googleMapsUrl, lat, lng) {
   await pool.query(
     `INSERT INTO nivaas_property_locations
        (id, property_id, google_maps_url, latitude, longitude)
-     VALUES (UUID(), ?, ?, ?, ?)
-     ON DUPLICATE KEY UPDATE
-       google_maps_url = VALUES(google_maps_url),
-       latitude        = VALUES(latitude),
-       longitude       = VALUES(longitude),
-       updated_at      = CURRENT_TIMESTAMP`,
+     VALUES (gen_random_uuid(), ?, ?, ?, ?)
+     ON CONFLICT (property_id) DO UPDATE SET
+       google_maps_url = EXCLUDED.google_maps_url,
+       latitude        = EXCLUDED.latitude,
+       longitude       = EXCLUDED.longitude,
+       updated_at      = NOW()`,
     [propertyId, googleMapsUrl, lat, lng]
   );
 }
@@ -159,16 +135,6 @@ async function upsertPropertyLocation(propertyId, googleMapsUrl, lat, lng) {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/properties
 // ─────────────────────────────────────────────────────────────────────────────
-// Query params: city, listing_type, property_type, min_price, max_price,
-//               furnished, q (search), limit, offset, sort,
-//               bedrooms, available_from, locality,
-//               lat_min, lat_max, lng_min, lng_max  (bounding-box for map)
-//               has_coords ("true" = only return properties with exact location)
-//
-// LOCATION NOTE: Coordinates in the response come exclusively from
-// nivaas_property_locations (LEFT JOINed). If a property has no row there,
-// location fields are null. NO fallback / approximate coordinates are injected.
-
 router.get("/", optionalAuth, async (req, res) => {
   try {
     const {
@@ -178,12 +144,11 @@ router.get("/", optionalAuth, async (req, res) => {
       lat_min, lat_max, lng_min, lng_max, has_coords,
     } = req.query;
 
-    // ── WHERE clause ──────────────────────────────────────────────────────────
     let where = " WHERE p.status = 'active'";
     const whereParams = [];
 
     if (city)           { where += " AND p.city = ?";            whereParams.push(city); }
-    if (locality)       { where += " AND p.locality LIKE ?";     whereParams.push(`%${locality}%`); }
+    if (locality)       { where += " AND p.locality ILIKE ?";    whereParams.push(`%${locality}%`); }
     if (listing_type)   { where += " AND p.listing_type = ?";    whereParams.push(listing_type); }
     if (property_type)  { where += " AND p.property_type = ?";   whereParams.push(property_type); }
     if (min_price)      { where += " AND p.price >= ?";          whereParams.push(Number(min_price)); }
@@ -195,23 +160,21 @@ router.get("/", optionalAuth, async (req, res) => {
       whereParams.push(available_from);
     }
     if (q) {
-      where += " AND (p.title LIKE ? OR p.locality LIKE ? OR p.city LIKE ? OR p.address LIKE ?)";
+      where += " AND (p.title ILIKE ? OR p.locality ILIKE ? OR p.city ILIKE ? OR p.address ILIKE ?)";
       const like = `%${q}%`;
       whereParams.push(like, like, like, like);
     }
 
-    // Bounding-box: filter on exact coords in property_locations
     if (lat_min !== undefined) { where += " AND pl.latitude >= ?";  whereParams.push(Number(lat_min)); }
     if (lat_max !== undefined) { where += " AND pl.latitude <= ?";  whereParams.push(Number(lat_max)); }
     if (lng_min !== undefined) { where += " AND pl.longitude >= ?"; whereParams.push(Number(lng_min)); }
     if (lng_max !== undefined) { where += " AND pl.longitude <= ?"; whereParams.push(Number(lng_max)); }
 
-    // has_coords=true → only properties that have an exact owner-pinned location
     if (has_coords === "true") {
       where += " AND pl.property_id IS NOT NULL";
     }
 
-    // ── COUNT query ───────────────────────────────────────────────────────────
+    // COUNT query
     const countSql = `
       SELECT COUNT(DISTINCT p.id) AS total
       FROM nivaas_properties p
@@ -219,42 +182,44 @@ router.get("/", optionalAuth, async (req, res) => {
       ${where}`;
     const [[{ total }]] = await pool.query(countSql, whereParams);
 
-    // ── DATA query ────────────────────────────────────────────────────────────
+    // DATA query
     let sql = `
       SELECT
         p.*,
         u.full_name  AS owner_name,
         u.phone      AS owner_phone,
-        ROUND(AVG(r.rating), 1) AS avg_rating,
-        COUNT(DISTINCT r.id)    AS review_count,
-        pl.google_maps_url      AS location_google_maps_url,
-        pl.latitude             AS location_latitude,
-        pl.longitude            AS location_longitude
+        ROUND(AVG(r.rating)::numeric, 1) AS avg_rating,
+        COUNT(DISTINCT r.id)             AS review_count,
+        pl.google_maps_url               AS location_google_maps_url,
+        pl.latitude                      AS location_latitude,
+        pl.longitude                     AS location_longitude
       FROM nivaas_properties p
       LEFT JOIN nivaas_users u ON u.id = p.owner_id
       LEFT JOIN nivaas_reviews r ON r.property_id = p.id
       LEFT JOIN nivaas_property_locations pl ON pl.property_id = p.id
       ${where}
-      GROUP BY p.id, pl.latitude, pl.longitude, pl.google_maps_url
+      GROUP BY p.id, u.full_name, u.phone, pl.latitude, pl.longitude, pl.google_maps_url
     `;
 
-    if (sort === "price_asc")    sql += " ORDER BY p.price ASC";
+    if (sort === "price_asc")       sql += " ORDER BY p.price ASC";
     else if (sort === "price_desc") sql += " ORDER BY p.price DESC";
-    else                         sql += " ORDER BY p.created_at DESC";
+    else                            sql += " ORDER BY p.created_at DESC";
 
     sql += " LIMIT ? OFFSET ?";
     const dataParams = [...whereParams, Number(limit), Number(offset)];
 
     const [rows] = await pool.query(sql, dataParams);
 
-    // ── Attach images ─────────────────────────────────────────────────────────
+    // Attach images
     const ids = rows.map(r => r.id);
     let images = [];
     if (ids.length > 0) {
-      [images] = await pool.query(
-        "SELECT property_id, url, is_cover, sort_order FROM nivaas_property_images WHERE property_id IN (?) ORDER BY sort_order ASC",
+      // pg doesn't support IN (?) with array — use = ANY($1)
+      const result = await pool._pool.query(
+        "SELECT property_id, url, is_cover, sort_order FROM nivaas_property_images WHERE property_id = ANY($1) ORDER BY sort_order ASC",
         [ids]
       );
+      images = result.rows;
     }
     const imgMap = {};
     images.forEach(img => {
@@ -262,23 +227,15 @@ router.get("/", optionalAuth, async (req, res) => {
       imgMap[img.property_id].push(img.url);
     });
 
-    // ── Build response ────────────────────────────────────────────────────────
-    // location_latitude / location_longitude come from nivaas_property_locations.
-    // If NULL → this property has no exact owner-provided location.
-    // NO fallback is injected. Frontend must treat null coords as "no pin".
-
     const result = rows.map(p => {
       const lat = p.location_latitude  != null ? Number(p.location_latitude)  : null;
       const lng = p.location_longitude != null ? Number(p.location_longitude) : null;
       const hasExactLocation = lat !== null && lng !== null && !(lat === 0 && lng === 0);
-
       return {
         ...p,
-        // Expose exact owner coords (null if not provided)
         latitude:      hasExactLocation ? lat : null,
         longitude:     hasExactLocation ? lng : null,
         map_url:       p.location_google_maps_url ?? p.map_url ?? null,
-        // Always false — we never inject approximate coordinates
         location_approximate: false,
         images: imgMap[p.id] || (p.cover_image_url ? [p.cover_image_url] : []),
       };
@@ -294,9 +251,6 @@ router.get("/", optionalAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/properties/:id
 // ─────────────────────────────────────────────────────────────────────────────
-// Returns the property with location joined from nivaas_property_locations.
-// Coordinates are null if owner never provided a Google Maps link.
-
 router.get("/:id", optionalAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -307,24 +261,24 @@ router.get("/:id", optionalAuth, async (req, res) => {
          u.full_name AS owner_name, u.phone AS owner_phone,
          u.email AS owner_email, u.avatar_url AS owner_avatar,
          u.is_verified AS owner_verified,
-         ROUND(AVG(r.rating),1) AS avg_rating,
-         COUNT(DISTINCT r.id)   AS review_count,
-         pl.google_maps_url     AS location_google_maps_url,
-         pl.latitude            AS location_latitude,
-         pl.longitude           AS location_longitude
+         ROUND(AVG(r.rating)::numeric, 1) AS avg_rating,
+         COUNT(DISTINCT r.id)             AS review_count,
+         pl.google_maps_url               AS location_google_maps_url,
+         pl.latitude                      AS location_latitude,
+         pl.longitude                     AS location_longitude
        FROM nivaas_properties p
        LEFT JOIN nivaas_users u ON u.id = p.owner_id
        LEFT JOIN nivaas_reviews r ON r.property_id = p.id
        LEFT JOIN nivaas_property_locations pl ON pl.property_id = p.id
        WHERE p.id = ?
-       GROUP BY p.id, pl.latitude, pl.longitude, pl.google_maps_url`,
+       GROUP BY p.id, u.full_name, u.phone, u.email, u.avatar_url, u.is_verified,
+                pl.latitude, pl.longitude, pl.google_maps_url`,
       [id]
     );
 
     if (rows.length === 0) return res.status(404).json({ error: "Property not found" });
     const property = rows[0];
 
-    // Expose exact owner coords under the canonical fields
     const lat = property.location_latitude  != null ? Number(property.location_latitude)  : null;
     const lng = property.location_longitude != null ? Number(property.location_longitude) : null;
     const hasExactLocation = lat !== null && lng !== null && !(lat === 0 && lng === 0);
@@ -334,7 +288,7 @@ router.get("/:id", optionalAuth, async (req, res) => {
     property.map_url   = property.location_google_maps_url ?? property.map_url ?? null;
     property.location_approximate = false;
 
-    // Attach images
+    // Images
     const [imgs] = await pool.query(
       "SELECT url, is_cover, caption, sort_order FROM nivaas_property_images WHERE property_id = ? ORDER BY sort_order ASC",
       [id]
@@ -381,10 +335,6 @@ router.get("/:id", optionalAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/properties
 // ─────────────────────────────────────────────────────────────────────────────
-// Creates a property. If map_url is provided, resolves coordinates and saves
-// them to nivaas_property_locations (single source of truth).
-// lat/lng on nivaas_properties are kept in sync for legacy query compatibility.
-
 router.post("/", requireAuth, async (req, res) => {
   try {
     const id = uuidv4();
@@ -398,8 +348,7 @@ router.post("/", requireAuth, async (req, res) => {
       preferred_tenants, cover_image_url, rera_id, amenities = [],
     } = req.body;
 
-    const map_url  = req.body.map_url  || null;
-    // Accept pre-resolved coords from the frontend (from the location step resolver)
+    const map_url   = req.body.map_url  || null;
     const clientLat = req.body.latitude  ? Number(req.body.latitude)  : null;
     const clientLng = req.body.longitude ? Number(req.body.longitude) : null;
 
@@ -407,28 +356,21 @@ router.post("/", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "title, city and price are required" });
     }
 
-    // ── Resolve coordinates ───────────────────────────────────────────────────
-    // Priority 1: client sent pre-resolved lat/lng (from the new-property form resolver)
-    // Priority 2: server resolves from map_url (safety net for direct API calls)
-    // If no valid coords → no location row is created (no fake data ever stored).
-
+    // Resolve coordinates
     let resolvedLat = null;
     let resolvedLng = null;
 
     if (clientLat && clientLng && validCoords({ lat: clientLat, lng: clientLng })) {
       resolvedLat = clientLat;
       resolvedLng = clientLng;
-      console.log(`[POST /properties] Using client-resolved coords: ${resolvedLat},${resolvedLng}`);
     } else if (map_url) {
       const coords = await resolveCoordsFromMapUrl(map_url);
       if (coords) {
         resolvedLat = coords.lat;
         resolvedLng = coords.lng;
-        console.log(`[POST /properties] Server-resolved coords: ${resolvedLat},${resolvedLng}`);
       }
     }
 
-    // ── Insert property ───────────────────────────────────────────────────────
     await pool.query(
       `INSERT INTO nivaas_properties
          (id, owner_id, title, description, property_type, listing_type, status,
@@ -446,30 +388,31 @@ router.post("/", requireAuth, async (req, res) => {
         city, state || null, locality || null, address || null, pincode || null,
         resolvedLat, resolvedLng, map_url,
         price, deposit || null,
-        maintenance_fee, brokerage, price_negotiable ? 1 : 0,
+        maintenance_fee, brokerage, price_negotiable ? true : false,
         available_from || null, min_lease_months, preferred_tenants || null,
         cover_image_url || null, rera_id || null,
       ]
     );
 
-    // ── Save to property_locations (only if exact coords exist) ───────────────
+    // Save location (only if exact coords exist)
     if (resolvedLat && resolvedLng && map_url) {
       await upsertPropertyLocation(id, map_url, resolvedLat, resolvedLng);
-      console.log(`[POST /properties] Location saved for property ${id}`);
-    } else {
-      console.log(`[POST /properties] No exact location for property ${id} — map pin will not appear`);
     }
 
-    // ── Amenities ─────────────────────────────────────────────────────────────
+    // Amenities — PostgreSQL uses INSERT ... ON CONFLICT DO NOTHING instead of INSERT IGNORE
     if (amenities.length > 0) {
-      const placeholders = amenities.map(() => "?").join(",");
-      const [amenRows] = await pool.query(
-        `SELECT id, name FROM nivaas_amenities WHERE name IN (${placeholders})`,
-        amenities
+      const result = await pool._pool.query(
+        `SELECT id, name FROM nivaas_amenities WHERE name = ANY($1)`,
+        [amenities]
       );
-      if (amenRows.length > 0) {
-        const vals = amenRows.map(a => [id, a.id]);
-        await pool.query("INSERT IGNORE INTO nivaas_property_amenities (property_id, amenity_id) VALUES ?", [vals]);
+      const amenRows = result.rows;
+      for (const a of amenRows) {
+        await pool.query(
+          `INSERT INTO nivaas_property_amenities (property_id, amenity_id)
+           VALUES (?, ?)
+           ON CONFLICT (property_id, amenity_id) DO NOTHING`,
+          [id, a.id]
+        );
       }
     }
 
@@ -504,9 +447,6 @@ router.post("/", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // PATCH /api/properties/:id
 // ─────────────────────────────────────────────────────────────────────────────
-// Updates property fields. If map_url changes, re-resolves coordinates and
-// updates nivaas_property_locations accordingly.
-
 router.patch("/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -534,21 +474,18 @@ router.patch("/:id", requireAuth, async (req, res) => {
     }
     if (updates.length === 0) return res.status(400).json({ error: "Nothing to update" });
 
-    // ── Resolve location if map_url is being updated ──────────────────────────
-    const newMapUrl    = req.body.map_url;
-    const clientLat    = req.body.latitude  ? Number(req.body.latitude)  : null;
-    const clientLng    = req.body.longitude ? Number(req.body.longitude) : null;
+    const newMapUrl = req.body.map_url;
+    const clientLat = req.body.latitude  ? Number(req.body.latitude)  : null;
+    const clientLng = req.body.longitude ? Number(req.body.longitude) : null;
 
     if (newMapUrl) {
       let resolvedLat = null;
       let resolvedLng = null;
 
-      // Priority 1: client sent pre-resolved coords
       if (clientLat && clientLng && validCoords({ lat: clientLat, lng: clientLng })) {
         resolvedLat = clientLat;
         resolvedLng = clientLng;
       } else {
-        // Priority 2: check if we already have coords for this exact URL
         const [existing] = await pool.query(
           "SELECT map_url FROM nivaas_properties WHERE id = ?", [id]
         );
@@ -560,41 +497,31 @@ router.patch("/:id", requireAuth, async (req, res) => {
         const hasCoords = existingLoc[0]?.latitude && existingLoc[0]?.longitude;
 
         if (sameUrl && hasCoords) {
-          // URL unchanged and location already stored — nothing to re-resolve
           resolvedLat = Number(existingLoc[0].latitude);
           resolvedLng = Number(existingLoc[0].longitude);
         } else {
-          // New URL (or coords missing) — resolve from scratch
           const coords = await resolveCoordsFromMapUrl(newMapUrl);
           if (coords) {
             resolvedLat = coords.lat;
             resolvedLng = coords.lng;
-            console.log(`[PATCH /properties/${id}] Resolved coords: ${resolvedLat},${resolvedLng}`);
           }
         }
       }
 
-      // Update lat/lng on nivaas_properties (legacy sync)
       if (resolvedLat && resolvedLng) {
         updates.push("latitude = ?", "longitude = ?");
         values.push(resolvedLat, resolvedLng);
-
-        // Upsert into authoritative location table
         await upsertPropertyLocation(id, newMapUrl, resolvedLat, resolvedLng);
       } else {
-        // map_url provided but coords could not be resolved —
-        // remove any stale location row so no wrong pin is shown
         await pool.query(
           "DELETE FROM nivaas_property_locations WHERE property_id = ?", [id]
         );
-        console.warn(`[PATCH /properties/${id}] Could not resolve coords for new map_url — location row removed`);
       }
     }
 
     values.push(id);
     await pool.query(`UPDATE nivaas_properties SET ${updates.join(", ")} WHERE id = ?`, values);
 
-    // Return updated property with location joined
     const [rows] = await pool.query(
       `SELECT p.*, pl.google_maps_url AS location_google_maps_url,
               pl.latitude AS location_latitude, pl.longitude AS location_longitude
@@ -624,10 +551,6 @@ router.patch("/:id", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/properties/:id/resolve-coords
 // ─────────────────────────────────────────────────────────────────────────────
-// Admin / owner backfill endpoint.
-// Resolves and saves exact coordinates for a property that has a map_url
-// but no entry in nivaas_property_locations.
-
 router.post("/:id/resolve-coords", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -643,7 +566,6 @@ router.post("/:id/resolve-coords", requireAuth, async (req, res) => {
     const { map_url } = rows[0];
     if (!map_url) return res.status(422).json({ error: "No map_url set for this property" });
 
-    // Check if location already exists
     const [locRows] = await pool.query(
       "SELECT latitude, longitude FROM nivaas_property_locations WHERE property_id = ?", [id]
     );
@@ -658,18 +580,16 @@ router.post("/:id/resolve-coords", requireAuth, async (req, res) => {
     const coords = await resolveCoordsFromMapUrl(map_url);
     if (!coords) {
       return res.status(422).json({
-        error: "Could not extract coordinates from the stored map_url. Ask the owner to re-provide their Google Maps link."
+        error: "Could not extract coordinates from the stored map_url."
       });
     }
 
     await upsertPropertyLocation(id, map_url, coords.lat, coords.lng);
-    // Sync to main table for legacy compatibility
     await pool.query(
       "UPDATE nivaas_properties SET latitude = ?, longitude = ? WHERE id = ?",
       [coords.lat, coords.lng, id]
     );
 
-    console.log(`[resolve-coords] Stored location for ${id}: ${coords.lat},${coords.lng}`);
     res.json({ lat: coords.lat, lng: coords.lng, source: "resolved" });
   } catch (err) {
     console.error("[resolve-coords]", err.message);
@@ -680,7 +600,6 @@ router.post("/:id/resolve-coords", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE /api/properties/:id
 // ─────────────────────────────────────────────────────────────────────────────
-
 router.delete("/:id", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
@@ -691,7 +610,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
     if (check[0].owner_id !== req.user.id && req.user.role !== "admin") {
       return res.status(403).json({ error: "Forbidden" });
     }
-    // nivaas_property_locations is deleted via ON DELETE CASCADE
     await pool.query("DELETE FROM nivaas_properties WHERE id = ?", [id]);
     res.json({ message: "Deleted" });
   } catch (err) {
@@ -702,7 +620,6 @@ router.delete("/:id", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/properties/owner/mine
 // ─────────────────────────────────────────────────────────────────────────────
-
 router.get("/owner/mine", requireAuth, async (req, res) => {
   try {
     const [rows] = await pool.query(
@@ -722,14 +639,14 @@ router.get("/owner/mine", requireAuth, async (req, res) => {
       [req.user.id]
     );
 
-    // Attach cover images
     const ids = rows.map(r => r.id);
     let images = [];
     if (ids.length > 0) {
-      [images] = await pool.query(
-        "SELECT property_id, url FROM nivaas_property_images WHERE property_id IN (?) AND is_cover = 1",
+      const result = await pool._pool.query(
+        "SELECT property_id, url FROM nivaas_property_images WHERE property_id = ANY($1) AND is_cover = true",
         [ids]
       );
+      images = result.rows;
     }
     const imgMap = {};
     images.forEach(i => { imgMap[i.property_id] = i.url; });

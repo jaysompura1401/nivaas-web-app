@@ -7,7 +7,6 @@ import { createNotification } from "../lib/notifications.js";
 const router = Router();
 
 // ─── GET /api/verification/pending ───────────────────────────────────────────
-// Admin/verification team: list all properties pending verification
 router.get("/pending", requireAuth, async (req, res) => {
   try {
     const isStaff = ["admin", "verification_team"].includes(req.user.role);
@@ -45,7 +44,6 @@ router.get("/logs/:propertyId", requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/verification/submit/:propertyId ───────────────────────────────
-// Owner submits property for verification
 router.post("/submit/:propertyId", requireAuth, async (req, res) => {
   try {
     const { propertyId } = req.params;
@@ -64,13 +62,11 @@ router.post("/submit/:propertyId", requireAuth, async (req, res) => {
       [propertyId]
     );
 
-    // Log action
     await pool.query(
       "INSERT INTO nivaas_verification_logs (id, property_id, verifier_id, action, notes) VALUES (?,?,?,?,?)",
       [uuidv4(), propertyId, req.user.id, "submitted", "Owner submitted for verification"]
     );
 
-    // Notify verification team
     const [staff] = await pool.query(
       "SELECT id FROM nivaas_users WHERE role IN ('admin','verification_team') LIMIT 5"
     );
@@ -89,7 +85,6 @@ router.post("/submit/:propertyId", requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/verification/action/:propertyId ───────────────────────────────
-// Verification team: approve, reject, or mark inspection done
 router.post("/action/:propertyId", requireAuth, async (req, res) => {
   try {
     const isStaff = ["admin", "verification_team"].includes(req.user.role);
@@ -107,10 +102,9 @@ router.post("/action/:propertyId", requireAuth, async (req, res) => {
     );
     if (!prop.length) return res.status(404).json({ error: "Property not found" });
 
-    // Update property verification status
     if (action === "approved") {
       await pool.query(
-        "UPDATE nivaas_properties SET verification_status='verified', verified=1 WHERE id=?",
+        "UPDATE nivaas_properties SET verification_status='verified', verified=true WHERE id=?",
         [propertyId]
       );
     } else if (action === "rejected") {
@@ -120,13 +114,11 @@ router.post("/action/:propertyId", requireAuth, async (req, res) => {
       );
     }
 
-    // Insert log
     await pool.query(
       "INSERT INTO nivaas_verification_logs (id, property_id, verifier_id, action, notes, report_url) VALUES (?,?,?,?,?,?)",
       [uuidv4(), propertyId, req.user.id, action, notes || null, report_url || null]
     );
 
-    // Notify owner
     const msg = action === "approved"
       ? `"${prop[0].title}" has been verified and marked with a Verified badge.`
       : action === "rejected"
@@ -140,7 +132,6 @@ router.post("/action/:propertyId", requireAuth, async (req, res) => {
       `/properties/${propertyId}`
     );
 
-    // Audit log
     await pool.query(
       `INSERT INTO nivaas_audit_logs (id, actor_id, action, entity, entity_id, details)
        VALUES (?,?,?,?,?,?)`,

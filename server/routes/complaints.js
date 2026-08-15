@@ -7,7 +7,6 @@ import { createNotification } from "../lib/notifications.js";
 const router = Router();
 
 // ─── GET /api/complaints ──────────────────────────────────────────────────────
-// Admins see all; others see only their own
 router.get("/", requireAuth, async (req, res) => {
   try {
     const isAdmin = ["admin", "verification_team"].includes(req.user.role);
@@ -44,7 +43,6 @@ router.get("/:id", requireAuth, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ error: "Complaint not found" });
     const c = rows[0];
-    // Only reporter or admin may view
     const isAdmin = ["admin", "verification_team"].includes(req.user.role);
     if (!isAdmin && c.reporter_id !== req.user.id) {
       return res.status(403).json({ error: "Forbidden" });
@@ -70,7 +68,6 @@ router.post("/", requireAuth, async (req, res) => {
       [id, property_id || null, req.user.id, reported_user_id || null, category, subject, description]
     );
 
-    // Notify admins
     const [admins] = await pool.query(
       "SELECT id FROM nivaas_users WHERE role = 'admin' LIMIT 5"
     );
@@ -103,7 +100,6 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
       [status, admin_notes || null, resolved_at, req.params.id]
     );
 
-    // Notify reporter
     const [rows] = await pool.query(
       "SELECT reporter_id, subject FROM nivaas_complaints WHERE id=?",
       [req.params.id]
@@ -123,7 +119,6 @@ router.patch("/:id/status", requireAuth, async (req, res) => {
 });
 
 // ─── POST /api/complaints/:propertyId/reviews ─────────────────────────────────
-// Reviews are attached to this router for convenience — could also be in properties
 router.post("/reviews/:propertyId", requireAuth, async (req, res) => {
   try {
     const { propertyId } = req.params;
@@ -132,14 +127,15 @@ router.post("/reviews/:propertyId", requireAuth, async (req, res) => {
       return res.status(400).json({ error: "rating must be 1–5" });
     }
     const id = uuidv4();
+    // PostgreSQL: ON CONFLICT (property_id, reviewer_id) DO UPDATE
     await pool.query(
       `INSERT INTO nivaas_reviews (id, property_id, reviewer_id, rating, comment)
        VALUES (?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE rating=VALUES(rating), comment=VALUES(comment)`,
+       ON CONFLICT (property_id, reviewer_id) DO UPDATE
+         SET rating = EXCLUDED.rating, comment = EXCLUDED.comment`,
       [id, propertyId, req.user.id, rating, comment || null]
     );
 
-    // Notify property owner
     const [propRows] = await pool.query(
       "SELECT owner_id, title FROM nivaas_properties WHERE id=?", [propertyId]
     );
