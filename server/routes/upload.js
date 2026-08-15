@@ -1,0 +1,148 @@
+import { Router } from "express";
+import multer from "multer";
+import path from "path";
+import { fileURLToPath } from "url";
+import { v4 as uuidv4 } from "uuid";
+import pool from "../db.js";
+import { requireAuth } from "../middleware/auth.js";
+
+const router = Router();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
+
+// ─── Multer config ────────────────────────────────────────────────────────────
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => {
+    cb(null, path.join(__dirname, "../uploads"));
+  },
+  filename: (_req, file, cb) => {
+    const ext  = path.extname(file.originalname).toLowerCase();
+    const name = `${uuidv4()}${ext}`;
+    cb(null, name);
+  },
+});
+
+const fileFilter = (_req, file, cb) => {
+  const allowed = ["image/jpeg", "image/jpg", "image/png", "image/webp"];
+  if (allowed.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error("Only JPG, PNG and WEBP images are allowed"), false);
+  }
+};
+
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB per image
+});
+
+// ─── POST /api/upload/property-images/:propertyId ─────────────────────────────
+// Accepts up to 10 images. First image is automatically set as cover.
+router.post(
+  "/property-images/:propertyId",
+  requireAuth,
+  upload.array("images", 10),
+  async (req, res) => {
+    try {
+      const { propertyId } = req.params;
+      const files = req.files;
+
+      if (!files || files.length === 0) {
+        return res.status(400).json({ error: "At least one image is required" });
+      }
+
+      // Verify property belongs to this owner
+      const [propRows] = await pool.query(
+        "SELECT owner_id FROM nivaas_properties WHERE id = ?",
+        [propertyId]
+      );
+      if (propRows.length === 0) {
+        return res.status(404).json({ error: "Property not found" });
+      }
+      if (propRows[0].owner_id !== req.user.id && req.user.role !== "admin") {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      const baseUrl = `${req.protocol}://${req.get("host")}`;
+      const inserted = [];
+
+      for (let i = 0; i < files.length; i++) {
+        const file     = files[i];
+        const id       = uuidv4();
+        const url      = `${baseUrl}/uploads/${file.filename}`;
+        const isCover  = i === 0 ? 1 : 0;
+
+        await pool.query(
+          `INSERT INTO nivaas_property_images
+             (id, property_id, url, storage_path, is_cover, sort_order)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [id, propertyId, url, file.filename, isCover, i]
+        );
+
+        inserted.push({ id, url, is_cover: isCover, sort_order: i });
+      }
+
+      // Set cover_image_url on the property itself
+      await pool.query(
+        "UPDATE nivaas_properties SET cover_image_url = ? WHERE id = ?",
+        [inserted[0].url, propertyId]
+      );
+
+      res.status(201).json({ images: inserted, count: inserted.length });
+    } catch (err) {
+      console.error("Upload error:", err);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ─── DELETE /api/upload/property-images/:imageId ──────────────────────────────
+router.delete("/property-images/:imageId", requireAuth, async (req, res) => {
+  try {
+    const { imageId } = req.params;
+
+    const [rows] = await pool.query(
+      `SELECT pi.*, p.owner_id
+       FROM nivaas_property_images pi
+       JOIN nivaas_properties p ON p.id = pi.property_id
+       WHERE pi.id = ?`,
+      [imageId]
+    );
+    if (rows.length === 0) return res.status(404).json({ error: "Image not found" });
+    if (rows[0].owner_id !== req.user.id && req.user.role !== "admin") {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // Delete file from disk
+    const filePath = path.join(__dirname, "../uploads", rows[0].storage_path);
+    try {
+      const fs = await import("fs");
+      fs.unlinkSync(filePath);
+    } catch {
+      // File already gone — continue
+    }
+
+    await pool.query("DELETE FROM nivaas_property_images WHERE id = ?", [imageId]);
+
+    res.json({ message: "Image deleted" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── GET /api/upload/property-images/:propertyId ──────────────────────────────
+router.get("/property-images/:propertyId", async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      "SELECT id, url, is_cover, sort_order, caption FROM nivaas_property_images WHERE property_id = ? ORDER BY sort_order ASC",
+      [req.params.propertyId]
+    );
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+export default router;
